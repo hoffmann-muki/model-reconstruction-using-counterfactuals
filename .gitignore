@@ -12,7 +12,6 @@ __pycache__/
 
 # Numpy / experiment outputs
 *.npy
-results/
 
 # Jupyter
 .ipynb_checkpoints
@@ -30,3 +29,7 @@ results/
 
 # lockfiles
 requirements-lock.txt
+
+# Ignore any results subfolder whose name starts with "test"
+results/test*/
+results/test_*/
