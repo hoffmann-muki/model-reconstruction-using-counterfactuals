@@ -1,0 +1,15 @@
+numpy>=1.21
+scipy
+pandas
+matplotlib
+scikit-learn
+tensorflow
+torch
+tqdm
+datasets
+dice-ml
+lime
+choix
+foolbox
+adversarial-robustness-toolbox
+# Optional / env-specific: for GPU builds, install the appropriate torch and tensorflow packages from their official instructions

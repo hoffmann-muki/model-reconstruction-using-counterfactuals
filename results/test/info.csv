@@ -1,0 +1,2 @@
+,query_batch_size,query_gen_method,num_queries,ensemble_size,targ_epochs,surr_epochs,batch_size,dataset,num_models
+0,50,naivedat,8,50,200,200,32,heloc,1

@@ -29,10 +29,10 @@ if __name__=='__main__':
                               'can be a float in [0,1] or \'prediction\' to use the softmax output of the target'))
     parser.add_argument('--loss_type', type=str, default='onesidemod', 
                         choices=['onesidemod', 'ordinary', 'bcecf', 'twosidemod'],
-                        help=('onesidemod: CCA loss as described in the paper, '
-                              'ordinary: ordinary binary cross entropy loss with hard labels, ',
-                              'bcecf: binary cross entropy loss with soft labels, ',
-                              'twosidemod: CCA loss, but now accounts for CFs from both sides of the decision boundary'))
+                        help=('onesidemod: CCA loss as described in the paper; '
+                              'ordinary: ordinary binary cross entropy loss with hard labels; '
+                              'bcecf: binary cross entropy loss with soft labels; '
+                              'twosidemod: CCA loss that accounts for CFs from both sides of the decision boundary'))
 
     args = parser.parse_args()
     imp_naive = [-1]

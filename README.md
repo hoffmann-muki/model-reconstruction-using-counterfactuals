@@ -6,6 +6,7 @@ This repository provides the code for the paper [*"Model reconstruction using co
 ```bash
 pip install foolbox
 pip install adversarial-robustness-toolbox
+pip install -r requirements.txt
 ```
 
 ### Running the experiments
