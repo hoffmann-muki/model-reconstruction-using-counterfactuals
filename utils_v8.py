@@ -1,22 +1,17 @@
 import sys
 sys.path.insert(0, './consistency/')
 from consistency import IterativeSearch
-from consistency import RobXSearch
-
 from recourse_methods import *
 from recourse_utils import *
 
-import matplotlib.pyplot as plt
 import numpy as np
-import scipy as sp
 import pandas as pd
 import json
 import os
 from datetime import datetime
-import pickle
 
 import dice_ml
-import sklearn
+from sklearn.neighbors import NearestNeighbors
 
 import tensorflow as tf
 from tensorflow import keras
@@ -353,34 +348,50 @@ def get_modified_loss_fn(base_loss, k, loss_type):
         if is_k_neg1 or loss_type == 'ordinary':
             loss = base_loss(y_true_bin, y_pred)
         elif is_k_neg2 or loss_type == 'bcecf':
-            y_true_cf = 4 * tf.math.multiply(y_true, tf.math.subtract(1.0, y_true))
-            yy = 0.5 * y_true_cf + y_true_bin
+            # y_true_cf = 4 * y_true * (1 - y_true)
+            y_true_cf = tf.math.multiply(4.0, tf.math.multiply(y_true, tf.math.subtract(1.0, y_true)))
+            yy = tf.math.add(tf.math.multiply(0.5, y_true_cf), y_true_bin)
             loss = base_loss(yy, y_pred)
         elif loss_type == 'twosidemod':
             mask_pos_cf = tf.dtypes.cast(tf.math.equal(y_true, 0.5), tf.float32)
             mask_neg_cf = tf.dtypes.cast(tf.math.equal(y_true, -0.5), tf.float32)
-            mask_ordinary = tf.dtypes.cast(tf.math.not_equal(y_true**2, 0.25), tf.float32)
+            mask_ordinary = tf.dtypes.cast(tf.math.not_equal(tf.math.square(y_true), 0.25), tf.float32)
 
-            cf_pos_loss = tf.dtypes.cast(tf.math.less_equal(y_pred, k_tensor), tf.float32) * mask_pos_cf * (
-                        k_tensor * tf.math.log((k_tensor + 1e-5) / (y_pred + 1e-5)) 
-                        + (1-k_tensor) * tf.math.log((1-k_tensor + 1e-5) / (1-y_pred + 1e-5))
-                    )
-            cf_neg_loss = tf.dtypes.cast(tf.math.less_equal(1-k_tensor, y_pred), tf.float32) * mask_neg_cf * (
-                        k_tensor * tf.math.log((k_tensor + 1e-5) / (1-y_pred + 1e-5)) 
-                        + (1-k_tensor) * tf.math.log((1-k_tensor + 1e-5) / (y_pred + 1e-5))
-                    )
-            ord_loss = mask_ordinary * (- y_true * tf.math.log(y_pred + 1e-5) - (1-y_true) * tf.math.log(1-y_pred + 1e-5))
-            loss = tf.reduce_mean(cf_pos_loss + cf_neg_loss + ord_loss)
+            eps = 1e-5
+            # build the positive-CF loss term
+            pos_mask = tf.dtypes.cast(tf.math.less_equal(y_pred, k_tensor), tf.float32)
+            pos_term = tf.math.add(
+                tf.math.multiply(k_tensor, tf.math.log(tf.math.divide(tf.math.add(k_tensor, eps), tf.math.add(y_pred, eps)))),
+                tf.math.multiply(tf.math.subtract(1.0, k_tensor), tf.math.log(tf.math.divide(tf.math.add(tf.math.subtract(1.0, k_tensor), eps), tf.math.add(tf.math.subtract(1.0, y_pred), eps))))
+            )
+            cf_pos_loss = tf.math.multiply(tf.math.multiply(tf.dtypes.cast(pos_mask, tf.float32), mask_pos_cf), pos_term)
+
+            # build the negative-CF loss term
+            neg_mask = tf.dtypes.cast(tf.math.less_equal(tf.math.subtract(1.0, k_tensor), y_pred), tf.float32)
+            neg_term = tf.math.add(
+                tf.math.multiply(k_tensor, tf.math.log(tf.math.divide(tf.math.add(k_tensor, eps), tf.math.add(tf.math.subtract(1.0, y_pred), eps)))),
+                tf.math.multiply(tf.math.subtract(1.0, k_tensor), tf.math.log(tf.math.divide(tf.math.add(tf.math.subtract(1.0, k_tensor), eps), tf.math.add(y_pred, eps))))
+            )
+            cf_neg_loss = tf.math.multiply(tf.math.multiply(tf.dtypes.cast(neg_mask, tf.float32), mask_neg_cf), neg_term)
+
+            # ordinary binary cross-entropy part
+            bce_part = - (tf.math.multiply(y_true, tf.math.log(tf.math.add(y_pred, eps))) + tf.math.multiply(tf.math.subtract(1.0, y_true), tf.math.log(tf.math.add(tf.math.subtract(1.0, y_pred), eps))))
+            ord_loss = tf.math.multiply(mask_ordinary, bce_part)
+            loss = tf.reduce_mean(tf.math.add_n([cf_pos_loss, cf_neg_loss, ord_loss]))
         else:
             y_true_cf = tf.dtypes.cast(tf.math.equal(y_true, 0.5), tf.float32)
             y_valid_cf = tf.dtypes.cast(tf.math.greater_equal(y_true, 0.0), tf.float32)
 
-            cf_loss = tf.dtypes.cast(tf.math.less_equal(y_pred, k_tensor), tf.float32) * y_true_cf * (
-                        k_tensor * tf.math.log((k_tensor + 1e-5) / (y_pred + 1e-5)) 
-                        + (1-k_tensor) * tf.math.log((1-k_tensor + 1e-5) / (1-y_pred + 1e-5))
-                    )
-            bce_loss = (1-y_true_cf) * (- y_true * tf.math.log(y_pred + 1e-5) - (1-y_true) * tf.math.log(1-y_pred + 1e-5))
-            loss = tf.reduce_mean(tf.boolean_mask(cf_loss + bce_loss, tf.math.greater_equal(y_true, 0.0)) )
+            eps = 1e-5
+            mask_pred_le_k = tf.dtypes.cast(tf.math.less_equal(y_pred, k_tensor), tf.float32)
+            cf_term = tf.math.add(
+                tf.math.multiply(k_tensor, tf.math.log(tf.math.divide(tf.math.add(k_tensor, eps), tf.math.add(y_pred, eps)))),
+                tf.math.multiply(tf.math.subtract(1.0, k_tensor), tf.math.log(tf.math.divide(tf.math.add(tf.math.subtract(1.0, k_tensor), eps), tf.math.add(tf.math.subtract(1.0, y_pred), eps))))
+            )
+            cf_loss = tf.math.multiply(tf.math.multiply(tf.dtypes.cast(mask_pred_le_k, tf.float32), y_true_cf), cf_term)
+
+            bce_loss = tf.math.multiply(tf.math.subtract(1.0, y_true_cf), - (tf.math.multiply(y_true, tf.math.log(tf.math.add(y_pred, eps))) + tf.math.multiply(tf.math.subtract(1.0, y_true), tf.math.log(tf.math.add(tf.math.subtract(1.0, y_pred), eps)))))
+            loss = tf.reduce_mean(tf.boolean_mask(tf.math.add(cf_loss, bce_loss), tf.math.greater_equal(y_true, 0.0)))
         return loss
 
     return loss_fn
@@ -465,9 +476,8 @@ class Query_API:
 
             preds = self.model.predict(feature_vals)
             feature_vals = feature_vals.loc[preds >= 0.5] 
-
             if len(feature_vals) > 0:
-                nbrs = sklearn.neighbors.NearestNeighbors(n_neighbors=knn_k, algorithm='auto').fit(feature_vals)
+                nbrs = NearestNeighbors(n_neighbors=knn_k, algorithm='auto').fit(feature_vals)
                 
                 def generate_counterfactuals(x):
                     if len(x) > 0:
@@ -493,7 +503,7 @@ class Query_API:
             
             recourses=[]
             deltas=[]
-            def generate_counterfactuals(queries):
+            def generate_counterfactuals_roar(queries):
                 recourses=[]
                 deltas=[]
                 def baseline_model(x):
@@ -520,7 +530,7 @@ class Query_API:
                 cfs_df = pd.DataFrame(recourses, columns=feature_cols)
                 cfs_df = self.get_labeled_cfs(cfs=cfs_df, out_name=out_name)
                 return cfs_df
-            self.generate_counterfactuals = generate_counterfactuals
+            self.generate_counterfactuals = generate_counterfactuals_roar
             
         else: # DiCE counterfactuals
             m = dice_ml.Model(model=model, backend=dice_backend)
@@ -787,9 +797,9 @@ def generate_stats(exp_dir, pop_noncf=True, noise_sigma=0, loss_type='onesidemod
     print(f'imp_naive: {imp_naive}, imp_smart: {imp_smart}')
 
     for m in range(num_models):
-        naive_models.append(tf.keras.models.load_model('{}/naive_model_{:02d}.keras'.format(exp_dir, m), \
+        naive_models.append(keras.models.load_model('{}/naive_model_{:02d}.keras'.format(exp_dir, m), \
             custom_objects={'loss_fn':get_modified_loss_fn(keras.losses.BinaryCrossentropy(from_logits=False), imp_naive[m], loss_type=loss_type)}))
-        smart_models.append(tf.keras.models.load_model('{}/smart_model_{:02d}.keras'.format(exp_dir, m), \
+        smart_models.append(keras.models.load_model('{}/smart_model_{:02d}.keras'.format(exp_dir, m), \
             custom_objects={'loss_fn':get_modified_loss_fn(keras.losses.BinaryCrossentropy(from_logits=False), imp_smart[m], loss_type=loss_type)}))
 
     query_batch_size = int(info_df['query_batch_size'][0])
@@ -814,7 +824,7 @@ def generate_stats(exp_dir, pop_noncf=True, noise_sigma=0, loss_type='onesidemod
         seed_layers = np.random.randint(100)
         tf.random.set_seed(np.random.randint(100))
 
-        targ_model = tf.keras.models.load_model('{}/targ_model_{:03d}.keras'.format(exp_dir, i))
+        targ_model = keras.models.load_model('{}/targ_model_{:03d}.keras'.format(exp_dir, i))
         print(f'sample: {i} targ_accuracy: {evaluate_models([targ_model], x_tst, y_tst)[0][0]}')
 
         results = pd.read_csv('{}/query_{:03d}_{:03d}.csv'.format(exp_dir,i,0), index_col=0)
