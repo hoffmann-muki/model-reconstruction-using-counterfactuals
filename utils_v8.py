@@ -52,7 +52,12 @@ def generate_duo_models(models):
 
 def compile_models(models, losses, optimizers, metrics):
     for i in range(len(models)):
-        models[i].compile(loss=losses[i], optimizer=optimizers[i], metrics=metrics[i])
+        # Keras expects the `metrics` argument to be a list, tuple, or dict.
+        # Allow callers to pass a single metric object per-model and wrap it into a list.
+        metric_arg = metrics[i]
+        if not isinstance(metric_arg, (list, tuple, dict)):
+            metric_arg = [metric_arg]
+        models[i].compile(loss=losses[i], optimizer=optimizers[i], metrics=metric_arg)
 
 def train_models(models, x_trn, y_trn, epochs, batch_size=32, verbose=0):
     history = []
@@ -329,44 +334,55 @@ class ProcessedDataset:
 
 
 def get_modified_loss_fn(base_loss, k, loss_type):
-    k = tf.cast(k, tf.float32)
+    # Evaluate k as a Python float when possible to avoid Python boolean checks on tensors in graph mode
+    try:
+        k_py = float(k)
+    except Exception:
+        k_py = None
+
+    is_k_neg1 = (k_py == -1)
+    is_k_neg2 = (k_py == -2)
+    k_tensor = tf.constant(k_py if k_py is not None else k, dtype=tf.float32)
+
     def loss_fn(y_true, y_pred):
         y_pred = tf.cast(y_pred, tf.float32)
         y_true = tf.cast(y_true, tf.float32)
         y_true_bin = tf.dtypes.cast(tf.math.greater_equal(y_true, 0.5), tf.float32)
-        if k == -1 or loss_type=='ordinary':
+
+        # Control flow based on Python-evaluated flags where possible
+        if is_k_neg1 or loss_type == 'ordinary':
             loss = base_loss(y_true_bin, y_pred)
-        elif k == -2 or loss_type=='bcecf':
-            y_true_cf = 4 * tf.math.multiply(y_true, tf.math.subtract(1.0, y_true)) # =1 if y_true=0.5, =0 if y_true=0,1
+        elif is_k_neg2 or loss_type == 'bcecf':
+            y_true_cf = 4 * tf.math.multiply(y_true, tf.math.subtract(1.0, y_true))
             yy = 0.5 * y_true_cf + y_true_bin
             loss = base_loss(yy, y_pred)
-        elif loss_type=='twosidemod':
+        elif loss_type == 'twosidemod':
             mask_pos_cf = tf.dtypes.cast(tf.math.equal(y_true, 0.5), tf.float32)
             mask_neg_cf = tf.dtypes.cast(tf.math.equal(y_true, -0.5), tf.float32)
             mask_ordinary = tf.dtypes.cast(tf.math.not_equal(y_true**2, 0.25), tf.float32)
 
-            cf_pos_loss = tf.dtypes.cast(tf.math.less_equal(y_pred, k), tf.float32) * mask_pos_cf * (
-                        k * tf.math.log((k + 1e-5) / (y_pred + 1e-5)) 
-                        + (1-k) * tf.math.log((1-k + 1e-5) / (1-y_pred + 1e-5))
+            cf_pos_loss = tf.dtypes.cast(tf.math.less_equal(y_pred, k_tensor), tf.float32) * mask_pos_cf * (
+                        k_tensor * tf.math.log((k_tensor + 1e-5) / (y_pred + 1e-5)) 
+                        + (1-k_tensor) * tf.math.log((1-k_tensor + 1e-5) / (1-y_pred + 1e-5))
                     )
-            cf_neg_loss = tf.dtypes.cast(tf.math.less_equal(1-k, y_pred), tf.float32) * mask_neg_cf * (
-                        k * tf.math.log((k + 1e-5) / (1-y_pred + 1e-5)) 
-                        + (1-k) * tf.math.log((1-k + 1e-5) / (y_pred + 1e-5))
+            cf_neg_loss = tf.dtypes.cast(tf.math.less_equal(1-k_tensor, y_pred), tf.float32) * mask_neg_cf * (
+                        k_tensor * tf.math.log((k_tensor + 1e-5) / (1-y_pred + 1e-5)) 
+                        + (1-k_tensor) * tf.math.log((1-k_tensor + 1e-5) / (y_pred + 1e-5))
                     )
             ord_loss = mask_ordinary * (- y_true * tf.math.log(y_pred + 1e-5) - (1-y_true) * tf.math.log(1-y_pred + 1e-5))
             loss = tf.reduce_mean(cf_pos_loss + cf_neg_loss + ord_loss)
         else:
-            # y_true_cf = 4 * tf.math.multiply(y_true, tf.math.subtract(1.0, y_true)) # =1 if y_true=0.5, =0 if y_true=0,1
             y_true_cf = tf.dtypes.cast(tf.math.equal(y_true, 0.5), tf.float32)
             y_valid_cf = tf.dtypes.cast(tf.math.greater_equal(y_true, 0.0), tf.float32)
 
-            cf_loss = tf.dtypes.cast(tf.math.less_equal(y_pred, k), tf.float32) * y_true_cf * (
-                        k * tf.math.log((k + 1e-5) / (y_pred + 1e-5)) 
-                        + (1-k) * tf.math.log((1-k + 1e-5) / (1-y_pred + 1e-5))
+            cf_loss = tf.dtypes.cast(tf.math.less_equal(y_pred, k_tensor), tf.float32) * y_true_cf * (
+                        k_tensor * tf.math.log((k_tensor + 1e-5) / (y_pred + 1e-5)) 
+                        + (1-k_tensor) * tf.math.log((1-k_tensor + 1e-5) / (1-y_pred + 1e-5))
                     )
             bce_loss = (1-y_true_cf) * (- y_true * tf.math.log(y_pred + 1e-5) - (1-y_true) * tf.math.log(1-y_pred + 1e-5))
             loss = tf.reduce_mean(tf.boolean_mask(cf_loss + bce_loss, tf.math.greater_equal(y_true, 0.0)) )
         return loss
+
     return loss_fn
 
 
@@ -584,8 +600,9 @@ def define_models(dataframe, targ_arch, surr_archs):
     targ_reg_coef = 0.001
     surr_reg_coef = 0.001
 
-    t_in = keras.layers.Input((len(dataframe.columns),))
-    t = keras.layers.Lambda(lambda x : tf.cast(x, dtype=tf.float32))(t_in)
+    # set input dtype explicitly to avoid Lambda shape inference issues when cloning
+    t_in = keras.layers.Input((len(dataframe.columns),), dtype=tf.float32)
+    t = t_in
     for layer_size in targ_arch:
         t = keras.layers.Dense(units=layer_size, 
                            activation='relu', 
@@ -600,19 +617,19 @@ def define_models(dataframe, targ_arch, surr_archs):
     surr_models = []
 
     for surr_arch in surr_archs:
-      s_in = keras.layers.Input((len(dataframe.columns),))
-      s = keras.layers.Lambda(lambda x : tf.cast(x, dtype=tf.float32))(s_in)
-      for layer_size in surr_arch:
-          s = keras.layers.Dense(units=layer_size, 
-                            activation='relu', 
-                            kernel_regularizer=keras.regularizers.L2(l2=surr_reg_coef),
-                            )(s)
-      s = keras.layers.Dense(units=1, 
-                            activation='sigmoid', 
-                            kernel_regularizer=keras.regularizers.L2(l2=surr_reg_coef),
-                            )(s)
-      surr_model = keras.Model(inputs=s_in, outputs=s)
-      surr_models.append(surr_model)
+        s_in = keras.layers.Input((len(dataframe.columns),), dtype=tf.float32)
+        s = s_in
+        for layer_size in surr_arch:
+            s = keras.layers.Dense(units=layer_size, 
+                              activation='relu', 
+                              kernel_regularizer=keras.regularizers.L2(l2=surr_reg_coef),
+                              )(s)
+        s = keras.layers.Dense(units=1, 
+                              activation='sigmoid', 
+                              kernel_regularizer=keras.regularizers.L2(l2=surr_reg_coef),
+                              )(s)
+        surr_model = keras.Model(inputs=s_in, outputs=s)
+        surr_models.append(surr_model)
 
     return targ_model, surr_models
 
@@ -700,8 +717,8 @@ def generate_query_data(exp_dir,
                 metrics=[keras.metrics.BinaryAccuracy(threshold=0.5)]*surrmodellen)
 
     for m in range(surrmodellen):
-        naive_models[m].save('{}/naive_model_{:02d}'.format(exp_dir, m))
-        smart_models[m].save('{}/smart_model_{:02d}'.format(exp_dir, m))
+        naive_models[m].save('{}/naive_model_{:02d}.keras'.format(exp_dir, m))
+        smart_models[m].save('{}/smart_model_{:02d}.keras'.format(exp_dir, m))
 
     info_list = [query_batch_size, query_gen_method, num_queries, ensemble_size, targ_epochs, surr_epochs, batch_size, \
                 dataset, len(smart_models)]
@@ -712,7 +729,6 @@ def generate_query_data(exp_dir,
     info_df.to_csv('{}/info.csv'.format(exp_dir))
 
     print('generating query data')
-
     for i in range(ensemble_size):
         if use_balanced_df:
             x_trn, y_trn, x_tst, y_tst, x_atk, y_atk, dataframe, numcols, catcols, targetcol = dataset_obj.get_splits()
@@ -733,24 +749,24 @@ def generate_query_data(exp_dir,
             attempt += 1
 
         print(f'sample: {i} targ_accuracy:{target_accuracy}')
-        targ_model.save('{}/targ_model_{:03d}'.format(exp_dir, i))
+        targ_model.save('{}/targ_model_{:03d}.keras'.format(exp_dir, i))
 
         query_api = Query_API(model=targ_model, dataframe=dataframe, cts_features=numcols, 
-                                out_name=targetcol, method=cf_method, generator=cf_generator, norm=cf_norm, 
-                                dice_backend=dice_backend, dice_method=dice_method,
-                                dice_proximity_weight=dice_proximity_weight,
-                                dice_posthoc_sparsity_param=dice_posthoc_sparsity_param,
-                                dice_features_to_vary=dice_features_to_vary,
-                                knn_k=knn_k, roar_lambda=roar_lambda, roar_delta_max=roar_delta_max, 
-                                cf_label=cf_label)
-        
+                              out_name=targetcol, method=cf_method, generator=cf_generator, norm=cf_norm, 
+                              dice_backend=dice_backend, dice_method=dice_method,
+                              dice_proximity_weight=dice_proximity_weight,
+                              dice_posthoc_sparsity_param=dice_posthoc_sparsity_param,
+                              dice_features_to_vary=dice_features_to_vary,
+                              knn_k=knn_k, roar_lambda=roar_lambda, roar_delta_max=roar_delta_max, 
+                              cf_label=cf_label)
+
         query_gen = Query_Gen(x_atk, catcols, numcols)
 
         for j in range(num_queries):
             queries = query_gen.generate_queries(query_batch_size, method=query_gen_method)
             results = query_api.query_api(queries)
             results.to_csv('{}/query_{:03d}_{:03d}.csv'.format(exp_dir,i,j))
-    
+
     return exp_dir
 
 
@@ -771,10 +787,10 @@ def generate_stats(exp_dir, pop_noncf=True, noise_sigma=0, loss_type='onesidemod
     print(f'imp_naive: {imp_naive}, imp_smart: {imp_smart}')
 
     for m in range(num_models):
-        naive_models.append(tf.keras.models.load_model('{}/naive_model_{:02d}'.format(exp_dir, m), \
-                custom_objects={'loss_fn':get_modified_loss_fn(keras.losses.BinaryCrossentropy(from_logits=False), imp_naive[m], loss_type=loss_type)}))
-        smart_models.append(tf.keras.models.load_model('{}/smart_model_{:02d}'.format(exp_dir, m), \
-                custom_objects={'loss_fn':get_modified_loss_fn(keras.losses.BinaryCrossentropy(from_logits=False), imp_smart[m], loss_type=loss_type)}))
+        naive_models.append(tf.keras.models.load_model('{}/naive_model_{:02d}.keras'.format(exp_dir, m), \
+            custom_objects={'loss_fn':get_modified_loss_fn(keras.losses.BinaryCrossentropy(from_logits=False), imp_naive[m], loss_type=loss_type)}))
+        smart_models.append(tf.keras.models.load_model('{}/smart_model_{:02d}.keras'.format(exp_dir, m), \
+            custom_objects={'loss_fn':get_modified_loss_fn(keras.losses.BinaryCrossentropy(from_logits=False), imp_smart[m], loss_type=loss_type)}))
 
     query_batch_size = int(info_df['query_batch_size'][0])
     query_gen_method = str(info_df['query_gen_method'][0])
@@ -794,11 +810,11 @@ def generate_stats(exp_dir, pop_noncf=True, noise_sigma=0, loss_type='onesidemod
     acc_smart = []
     for i in range(ensemble_size):
         x_trn, y_trn, x_tst, y_tst, x_atk, y_atk, dataframe, numcols, catcols, targetcol = dataset_obj.get_splits()
-        
+
         seed_layers = np.random.randint(100)
         tf.random.set_seed(np.random.randint(100))
-        
-        targ_model = tf.keras.models.load_model('{}/targ_model_{:03d}'.format(exp_dir, i))
+
+        targ_model = tf.keras.models.load_model('{}/targ_model_{:03d}.keras'.format(exp_dir, i))
         print(f'sample: {i} targ_accuracy: {evaluate_models([targ_model], x_tst, y_tst)[0][0]}')
 
         results = pd.read_csv('{}/query_{:03d}_{:03d}.csv'.format(exp_dir,i,0), index_col=0)
