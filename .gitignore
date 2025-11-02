@@ -1,0 +1,32 @@
+# Virtual environment
+.venv/
+
+# Python cache and compiled files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Keras model files
+*.keras
+
+# Numpy / experiment outputs
+*.npy
+results/
+
+# Jupyter
+.ipynb_checkpoints
+
+# Editor settings
+.vscode/
+.idea/
+*.swp
+
+# OS files
+.DS_Store
+
+# logs
+*.log
+
+# lockfiles
+requirements-lock.txt
