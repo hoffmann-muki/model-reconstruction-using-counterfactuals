@@ -12,12 +12,14 @@ from datetime import datetime
 
 import dice_ml
 from sklearn.neighbors import NearestNeighbors
+from sklearn import datasets as sk_datasets
 
 import tensorflow as tf
 from tensorflow import keras
 
 import datasets
 from datasets import load_dataset
+from typing import Optional
 
 def generate_test_models(surr_models):
     naive_surr_models = []
@@ -60,25 +62,70 @@ def train_models(models, x_trn, y_trn, epochs, batch_size=32, verbose=0):
         history.append(model.fit(x_trn, y_trn, epochs=epochs, batch_size=batch_size, verbose=verbose))
     return history
 
-def evaluate_models(surr_models, x_ref, y_ref=None, targ_model=None):
-    if y_ref is not None:
-        y = (y_ref >= 0.5).replace({True: 1.0, False: 0.0})
-
-    if targ_model is not None:
-        u = targ_model.predict(x_ref)
-        u = (u >= 0.5)
-    
+def evaluate_models(surr_models, x_ref, y_ref=None, targ_model=None, num_classes: int = 2):
+    """Evaluate surrogate models.
+    For binary (num_classes==2) keep previous behaviour (threshold 0.5).
+    For multiclass use argmax-based accuracy and fidelity.
+    Returns: (accuracies_list, fidelities_list)
+    """
     accuracies = []
     fidelities = []
+
+    # prepare true labels
+    if y_ref is not None:
+        # y_ref may be a pandas Series or numpy array of class labels
+        y_vals = np.array(y_ref)
+        if num_classes == 2:
+            # convert to binary 0/1 floats for Keras evaluate
+            try:
+                # if y_ref is pandas Series with boolean-like values
+                y = (y_ref >= 0.5).replace({True: 1.0, False: 0.0})
+            except Exception:
+                y = (y_vals >= 0.5).astype('float32')
+        else:
+            # multiclass labels: ensure integer dtype for sparse evaluation
+            y = y_vals.astype('int32')
+    else:
+        y = None
+
+    # prepare target predictions for fidelity
+    if targ_model is not None:
+        u_pred = targ_model.predict(x_ref)
+        if num_classes == 2:
+            u = (u_pred >= 0.5).astype('int32')
+        else:
+            u = np.argmax(u_pred, axis=1)
+    else:
+        u = None
+
     for surr_model in surr_models:
+        # fidelity: compare surrogate predictions to target predictions
         if targ_model is not None:
-            v = surr_model.predict(x_ref)
-            v = (v >= 0.5)
-            mismatch = np.where(u!=v, 1, 0)
-            fidelity = 1 - np.sum(mismatch)/len(x_ref)
+            v_pred = surr_model.predict(x_ref)
+            if num_classes == 2:
+                v = (v_pred >= 0.5).astype('int32')
+                mismatch = np.where(u != v, 1, 0)
+            else:
+                v = np.argmax(v_pred, axis=1)
+                mismatch = np.where(u != v, 1, 0)
+            fidelity = 1 - np.sum(mismatch) / len(x_ref)
             fidelities.append(fidelity)
-        if y_ref is not None:
-            accuracies.append(surr_model.evaluate(x_ref, y, verbose=0)[1])
+
+        # accuracy: compare surrogate predictions to ground-truth labels
+        if y is not None:
+            if num_classes == 2:
+                # Keras evaluate returns [loss, metric], we use model.evaluate to get metric
+                try:
+                    acc = surr_model.evaluate(x_ref, y, verbose=0)[1]
+                except Exception:
+                    # fallback to numpy-based accuracy
+                    preds = (surr_model.predict(x_ref) >= 0.5).astype('int32').reshape(-1)
+                    acc = float(np.mean(preds == np.array(y).astype('int32')))
+                accuracies.append(acc)
+            else:
+                preds = np.argmax(surr_model.predict(x_ref), axis=1)
+                acc = float(np.mean(preds == np.array(y).astype('int32')))
+                accuracies.append(acc)
 
     return accuracies, fidelities
 
@@ -193,10 +240,9 @@ def reset_weights(models, seed=None):
 
 #         dfs = [self.dataframe, self.dataframe_full]
 #         return [x_trn, y_trn, x_tst, y_tst, x_atk, y_atk, dfs, self.numcols, self.catcols, self.targetcol]
-    
 
 class ProcessedDataset:
-    def __init__(self, dataset):
+    def __init__(self, dataset, sample_limit: Optional[int] = None):
         datasets.utils.logging.set_verbosity(datasets.logging.ERROR)
         if dataset == 'adultincome':
             raw_data = load_dataset("jlh/uci-adult-income")["train"]
@@ -240,9 +286,78 @@ class ProcessedDataset:
             catcols = []
             dataframe = raw_data
         
-        # normalize data
-        dataframe = (dataframe-dataframe.min())/(dataframe.max()-dataframe.min())
-        dataframe[targetcol] = raw_data[targetcol]
+        elif dataset == 'iris':
+            # small multiclass tabular dataset
+            # load_iris can return either a Bunch or (data, target); request a tuple for consistent indexing
+            X, y = sk_datasets.load_iris(return_X_y=True)
+            targetcol = 'label'
+            df = pd.DataFrame(X, columns=[f'feat_{i}' for i in range(X.shape[1])])
+            df[targetcol] = y
+            dataframe = df
+            numcols = [c for c in df.columns if c != targetcol]
+            catcols = []
+
+        elif dataset == 'mnist':
+            # handwritten digits (multiclass) - flatten images
+            (x_trn, y_trn), (x_tst, y_tst) = keras.datasets.mnist.load_data()
+            X = np.concatenate([x_trn, x_tst], axis=0)
+            y = np.concatenate([y_trn, y_tst], axis=0)
+            # subsample if requested
+            if sample_limit is not None and sample_limit < X.shape[0]:
+                idx = np.random.choice(X.shape[0], sample_limit, replace=False)
+                X = X[idx]
+                y = y[idx]
+            X = X.reshape((X.shape[0], -1)).astype('float32') / 255.0
+            targetcol = 'label'
+            df = pd.DataFrame(X)
+            df[targetcol] = y
+            dataframe = df
+            numcols = [c for c in df.columns if c != targetcol]
+            catcols = []
+
+        elif dataset == 'cifar':
+            # CIFAR-10 (multiclass) - flatten RGB images
+            (x_trn, y_trn), (x_tst, y_tst) = keras.datasets.cifar10.load_data()
+            X = np.concatenate([x_trn, x_tst], axis=0)
+            y = np.concatenate([y_trn, y_tst], axis=0).squeeze()
+            # subsample if requested
+            if sample_limit is not None and sample_limit < X.shape[0]:
+                idx = np.random.choice(X.shape[0], sample_limit, replace=False)
+                X = X[idx]
+                y = y[idx]
+            X = X.reshape((X.shape[0], -1)).astype('float32') / 255.0
+            targetcol = 'label'
+            df = pd.DataFrame(X)
+            df[targetcol] = y
+            dataframe = df
+            numcols = [c for c in df.columns if c != targetcol]
+            catcols = []
+        
+        # normalize data (features to [0,1])
+        # Restore target column from available label sources when necessary
+        raw_target = None
+        raw_data_local = locals().get('raw_data', None)
+        if raw_data_local is not None:
+            try:
+                # ensure targetcol is defined in this scope before attempting to index raw_data_local
+                if 'targetcol' in locals():
+                    raw_target = raw_data_local[targetcol] # type: ignore
+                else:
+                    raw_target = None
+            except Exception:
+                raw_target = None
+
+        dataframe = (dataframe - dataframe.min())/(dataframe.max()-dataframe.min())
+        if raw_target is not None:
+            dataframe[targetcol] = raw_target
+        elif 'y' in locals():
+            dataframe[targetcol] = pd.Series(y, index=dataframe.index)
+        elif 'y_trn' in locals() and 'y_tst' in locals():
+            y_all = np.concatenate([y_trn, y_tst], axis=0)
+            dataframe[targetcol] = pd.Series(y_all, index=dataframe.index)
+        else:
+            # fallback: assume target column already present
+            dataframe[targetcol] = dataframe[targetcol]
 
         self.dataframe = dataframe
         self.targetcol = targetcol
@@ -296,16 +411,22 @@ class ProcessedDataset:
         train_size = int(np.round(0.5 * balanced_size_per_class))
         remaining_size = balanced_size_per_class - test_size - train_size
 
-        if attack_balance < 0.5:
-            attack_sizes = {
-                0: int(np.round(remaining_size * attack_balance / (1-attack_balance))),
-                1: remaining_size
-            }
+        # Build attack_sizes per class. For binary, preserve previous attack_balance behavior.
+        classes = self.dataframe[self.targetcol].unique()
+        if len(classes) == 2:
+            if attack_balance < 0.5:
+                attack_sizes = {
+                    classes[0]: int(np.round(remaining_size * attack_balance / (1-attack_balance))),
+                    classes[1]: remaining_size
+                }
+            else:
+                attack_sizes = {
+                    classes[0]: remaining_size,
+                    classes[1]: int(np.round(remaining_size * (1-attack_balance) / attack_balance))
+                }
         else:
-            attack_sizes = {
-                0: remaining_size,
-                1: int(np.round(remaining_size * (1-attack_balance) / attack_balance))
-            }
+            # For multiclass, allocate the remaining_size equally to each class by default
+            attack_sizes = {cls: remaining_size for cls in classes}
 
         # print('attack sizes:', attack_sizes,
         #       'total samples:', 2*(test_size+train_size) + attack_sizes[0] + attack_sizes[1],
@@ -439,18 +560,26 @@ class Query_Gen:
 class Query_API:
     def __init__(self, model, dataframe, cts_features, out_name, method, generator, norm, 
                  dice_backend, dice_method, dice_posthoc_sparsity_param, 
-                 dice_proximity_weight, dice_features_to_vary, knn_k, roar_lambda, roar_delta_max, cf_label):
+                 dice_proximity_weight, dice_features_to_vary, knn_k, roar_lambda, roar_delta_max, cf_label,
+                 cf_target_class=None, num_classes: int = 2):
         self.model = model
         self.out_name = out_name
         self.method = method
         self.cf_label = cf_label
+        self.cf_target_class = cf_target_class
+        self.num_classes = num_classes
 
         if generator == "itersearch" or generator=="mccf": # MCCF counterfactuals
             feature_cols = dataframe.columns[:-1]
             feature_vals = dataframe[feature_cols]
+            # ensure IterativeSearch receives multiclass information when available
+            try:
+                nc = int(num_classes)
+            except Exception:
+                nc = 2
             L2_iter_search = IterativeSearch(generate_duo_models([model])[0],
                                 clamp=[feature_vals.min(), feature_vals.max()],
-                                num_classes=2,
+                                num_classes=nc,
                                 eps=0.01,
                                 nb_iters=100,
                                 eps_iter=0.02,
@@ -473,27 +602,115 @@ class Query_API:
         elif generator == 'knn': # nearest neighbor counterfactuals
             feature_cols = dataframe.columns[:-1]
             feature_vals = dataframe[feature_cols]
-
+            # Build neighbor pools per class for multiclass-aware CFs
             preds = self.model.predict(feature_vals)
-            feature_vals = feature_vals.loc[preds >= 0.5] 
-            if len(feature_vals) > 0:
-                nbrs = NearestNeighbors(n_neighbors=knn_k, algorithm='auto').fit(feature_vals)
-                
-                def generate_counterfactuals(x):
-                    if len(x) > 0:
-                        dists, indices = nbrs.kneighbors(x)
-                        indices = np.ndarray.flatten(indices)
-                        cfs_df = pd.DataFrame(feature_vals.iloc[indices], columns=feature_cols)
-                    else:
-                        cfs_df = pd.DataFrame([], columns=dataframe.columns)
-                    cfs_df.loc[:, out_name] = 0.5
-                    return cfs_df
+            if preds.ndim == 1 or (hasattr(preds, 'shape') and preds.shape[1] == 1):
+                # binary: pool of samples with prediction==0 or 1 depending on cf_target_class
+                labels = (preds >= 0.5).astype('int32').reshape(-1)
             else:
-                def generate_counterfactuals(x):
+                labels = np.argmax(preds, axis=1)
+
+            # Build per-class pools and NearestNeighbors models
+            pools = {}
+            nbr_models = {}
+            for cls in np.unique(labels):
+                pool_df = feature_vals.loc[labels == cls]
+                if len(pool_df) > 0:
+                    try:
+                        nbr = NearestNeighbors(n_neighbors=min(knn_k, len(pool_df)), algorithm='auto').fit(pool_df)
+                        pools[int(cls)] = pool_df
+                        nbr_models[int(cls)] = nbr
+                    except Exception:
+                        pools[int(cls)] = pool_df
+
+            def generate_counterfactuals(x):
+                # x: DataFrame of queries (features)
+                if len(x) == 0:
                     cfs_df = pd.DataFrame([], columns=dataframe.columns)
-                    cfs_df.loc[:, out_name] = 0.5
+                    cfs_df.loc[:, out_name] = 0.5 if self.num_classes == 2 else -1
                     return cfs_df
-            
+
+                # Determine target class for CF: use cf_target_class if provided; else choose a class different from predicted
+                raw_preds_q = self.model.predict(x)
+                if raw_preds_q.ndim == 1 or (hasattr(raw_preds_q, 'shape') and raw_preds_q.shape[1] == 1):
+                    q_labels = (raw_preds_q >= 0.5).astype('int32').reshape(-1)
+                else:
+                    q_labels = np.argmax(raw_preds_q, axis=1)
+
+                target_classes = []
+                for ql in q_labels:
+                    if self.cf_target_class is not None:
+                        tcls = int(self.cf_target_class)
+                    else:
+                        # choose any class not equal to current prediction; prefer next class modulo num_classes
+                        if self.num_classes > 1:
+                            tcls = (int(ql) + 1) % max(2, self.num_classes)
+                        else:
+                            tcls = 1 - int(ql)
+                    target_classes.append(tcls)
+
+                # For each query, get nearest neighbors from the pool of the target class
+                # Build a global neighbor model for fallback searches across classes
+                cfs_list = []
+                try:
+                    nbr_all = NearestNeighbors(n_neighbors=min(max(10, knn_k), len(feature_vals)), algorithm='auto').fit(feature_vals)
+                except Exception:
+                    nbr_all = None
+
+                for idx, q in enumerate(x.values):
+                    tcls = target_classes[idx]
+                    pool_df = pools.get(tcls, None)
+                    nbr = nbr_models.get(tcls, None)
+                    if pool_df is None or nbr is None or len(pool_df) == 0:
+                        # Try to find nearest neighbor of the desired class using the global index
+                        found = False
+                        if nbr_all is not None:
+                            ksearch = min(50, len(feature_vals))
+                            try:
+                                dists_all, inds_all = nbr_all.kneighbors(q.reshape(1, -1), n_neighbors=ksearch)
+                                for cand_idx in inds_all[0]:
+                                    cand_label = int(labels[cand_idx])
+                                    if cand_label == tcls:
+                                        chosen = feature_vals.iloc[cand_idx]
+                                        cfs_list.append(np.concatenate([chosen.values, [tcls]]))
+                                        found = True
+                                        break
+                            except Exception:
+                                found = False
+
+                        if found:
+                            continue
+
+                        # no sample in desired class nearby; fall back to closest sample of any class
+                        if nbr_all is not None:
+                            try:
+                                dists_all, inds_all = nbr_all.kneighbors(q.reshape(1, -1), n_neighbors=1)
+                                chosen = feature_vals.iloc[inds_all[0][0]]
+                                fallback_label = int(labels[inds_all[0][0]])
+                                cfs_list.append(np.concatenate([chosen.values, [fallback_label]]))
+                                continue
+                            except Exception:
+                                pass
+
+                        # ultimate fallback: zero-vector + target label (or 0.5 for binary)
+                        if self.num_classes == 2:
+                            cf_row = np.concatenate([np.zeros(feature_vals.shape[1]), [0.5]])
+                        else:
+                            cf_row = np.concatenate([np.zeros(feature_vals.shape[1]), [tcls]])
+                        cfs_list.append(cf_row)
+                        continue
+
+                    dists, inds = nbr.kneighbors(q.reshape(1, -1))
+                    # take first neighbor
+                    chosen = pool_df.iloc[inds[0][0]]
+                    cfs_list.append(np.concatenate([chosen.values, [tcls]]))
+
+                cfs_arr = np.array(cfs_list)
+                # Construct DataFrame with same columns + target
+                cols = list(feature_cols) + [out_name]
+                cfs_df = pd.DataFrame(cfs_arr, columns=cols)
+                return cfs_df
+
             self.generate_counterfactuals = generate_counterfactuals
 
         elif generator == 'roar': # ROAR counterfactuals
@@ -503,18 +720,41 @@ class Query_API:
             
             recourses=[]
             deltas=[]
+            # prepare global neighbor index and predicted labels for ROAR fallback
+            try:
+                preds_all = self.model.predict(feature_vals)
+                if preds_all.ndim == 1 or (hasattr(preds_all, 'shape') and preds_all.shape[1] == 1):
+                    lbls_all = (preds_all >= 0.5).astype('int32').reshape(-1)
+                else:
+                    lbls_all = np.argmax(preds_all, axis=1)
+                try:
+                    ro_nbr_all = NearestNeighbors(n_neighbors=min(50, len(feature_vals)), algorithm='auto').fit(feature_vals)
+                except Exception:
+                    ro_nbr_all = None
+            except Exception:
+                ro_nbr_all = None
+                lbls_all = None
             def generate_counterfactuals_roar(queries):
                 recourses=[]
                 deltas=[]
                 def baseline_model(x):
                     x = pd.DataFrame(x, columns=feature_cols)
-                    preds = np.array(generate_duo_models([model])[0].predict(x)) >= 0.5
-                    return preds
+                    preds = generate_duo_models([model])[0].predict(x)
+                    # ensure multiclass-safe baseline: return integer labels for target selection
+                    if preds.ndim == 1 or (hasattr(preds, 'shape') and preds.shape[1] == 1):
+                        return (preds >= 0.5).astype('int32')
+                    else:
+                        return np.argmax(preds, axis=1).reshape(-1, 1)
                 
                 for xi in tqdm(range(len(queries))):
                     x = queries.iloc[xi]
                     try:
-                        y_target = baseline_model(np.array(x.values).reshape(1,-1))[0,0]
+                        bt = baseline_model(np.array(x.values).reshape(1,-1))
+                        # interpret baseline output as label
+                        if bt.ndim == 1 or (hasattr(bt, 'shape') and bt.shape[1] == 1):
+                            y_target = int(bt.reshape(-1)[0])
+                        else:
+                            y_target = int(bt.reshape(-1)[0])
                         np.random.seed(xi)
                         coefficients, intercept = lime_explanation(baseline_model, feature_vals.values, x.values)
                         robust_recourse = RobustRecourse(W=coefficients, W0=intercept, 
@@ -524,6 +764,40 @@ class Query_API:
                         recourses.append(r)
                         deltas.append(delta_r)
                     except Exception as e:
+                        # try to find a real sample of the desired class near the query using the global index
+                        found = False
+                        try:
+                            if self.num_classes > 2 and ro_nbr_all is not None and lbls_all is not None:
+                                ksearch = min(50, len(feature_vals))
+                                dists_all, inds_all = ro_nbr_all.kneighbors(x.values.reshape(1, -1), n_neighbors=ksearch)
+                                for cand_idx in inds_all[0]:
+                                    if int(lbls_all[cand_idx]) == y_target:
+                                        chosen = feature_vals.iloc[cand_idx]
+                                        recourses.append(chosen.values)
+                                        deltas.append(0.0)
+                                        found = True
+                                        break
+                        except Exception:
+                            found = False
+
+                        if found:
+                            continue
+
+                        # try a binary fallback if multiclass recourse fails
+                        try:
+                            if self.num_classes > 2:
+                                # attempt to coerce to binary target (0 or 1) by mapping multiclass target to 0/1
+                                fallback_target = 1 if y_target != 1 else 0
+                                robust_recourse = RobustRecourse(W=coefficients, W0=intercept, 
+                                                                feature_costs=None, y_target=fallback_target,
+                                                                delta_max=roar_delta_max)
+                                r, delta_r = robust_recourse.get_recourse(x.values, lamb=roar_lambda)
+                                recourses.append(r)
+                                deltas.append(delta_r)
+                                continue
+                        except Exception:
+                            pass
+
                         print(f'no counterfactuals generated for query {xi}')
                         print(e)
 
@@ -539,16 +813,34 @@ class Query_API:
 
             def generate_counterfactuals(x):
                 try:
-                    exp = e.generate_counterfactuals(x, total_CFs=1, desired_class="opposite",
-                                                    proximity_weight=dice_proximity_weight, 
-                                                    diversity_weight=0.0,
-                                                    features_to_vary=dice_features_to_vary,
-                                                    posthoc_sparsity_param=dice_posthoc_sparsity_param)
+                    # Determine desired_class for DiCE: explicit cf_target_class for multiclass,
+                    # 'opposite' for binary, or omit for DiCE default when multiclass target not provided
+                    if self.cf_target_class is not None:
+                        desired = int(self.cf_target_class)
+                        exp = e.generate_counterfactuals(x, total_CFs=1, desired_class=desired,
+                                                        proximity_weight=dice_proximity_weight,
+                                                        diversity_weight=0.0,
+                                                        features_to_vary=dice_features_to_vary,
+                                                        posthoc_sparsity_param=dice_posthoc_sparsity_param)
+                    else:
+                        if self.num_classes == 2:
+                            exp = e.generate_counterfactuals(x, total_CFs=1, desired_class="opposite",
+                                                            proximity_weight=dice_proximity_weight,
+                                                            diversity_weight=0.0,
+                                                            features_to_vary=dice_features_to_vary,
+                                                            posthoc_sparsity_param=dice_posthoc_sparsity_param)
+                        else:
+                            # multiclass but no explicit target: let DiCE choose
+                            exp = e.generate_counterfactuals(x, total_CFs=1,
+                                                            proximity_weight=dice_proximity_weight,
+                                                            diversity_weight=0.0,
+                                                            features_to_vary=dice_features_to_vary,
+                                                            posthoc_sparsity_param=dice_posthoc_sparsity_param)
                     cf = json.loads(exp.to_json())
-                except:
+                except Exception:
                     cf = {'cfs_list': [None]}
                     print('No counterfactuals found')
-                
+
                 cfs_list = []
                 for cfs in cf['cfs_list']:
                     if cfs is None:
@@ -565,23 +857,38 @@ class Query_API:
     def get_labeled_cfs(self, cfs:pd.DataFrame, out_name:str):
         if len(cfs) > 0:
             if self.cf_label == 'prediction':
-                cf_preds = (self.model.predict(cfs) >= 0.5).astype(np.float32)
-                cfs[out_name] = cf_preds - 0.5
-            elif self.cf_label >= 0:
+                preds = self.model.predict(cfs)
+                if preds.ndim == 1 or (hasattr(preds, 'shape') and preds.shape[1] == 1):
+                    cf_preds = (preds >= 0.5).astype(np.float32)
+                    # keep original binary scheme where CF label is centered at 0.5
+                    cfs[out_name] = cf_preds - 0.5
+                else:
+                    labels = np.argmax(preds, axis=1)
+                    cfs[out_name] = labels
+            elif isinstance(self.cf_label, (int, float)) and self.cf_label >= 0:
                 cfs[out_name] = self.cf_label
             return cfs
         else:
             return pd.DataFrame([], columns=[*cfs.columns, out_name])
 
     def query_api(self, x):
-        predictions = (self.model.predict(x) >= 0.5).astype(np.float32)
-        predictions = pd.DataFrame(predictions, columns=[self.out_name])
+        raw_preds = self.model.predict(x)
+        # Build a single-column predictions DataFrame: binary -> 0/1 float; multiclass -> label ints
+        if raw_preds.ndim == 1 or (hasattr(raw_preds, 'shape') and raw_preds.shape[1] == 1):
+            predictions = (raw_preds >= 0.5).astype(np.float32).reshape(-1, 1)
+            predictions_df = pd.DataFrame(predictions, columns=[self.out_name])
+            is_multiclass = False
+        else:
+            labels = np.argmax(raw_preds, axis=1)
+            predictions_df = pd.DataFrame(labels, columns=[self.out_name])
+            is_multiclass = True
+
         print(f'query API type: {self.method}')
         if self.method=='dualcfx':
             w = x
             counterfacts = self.generate_counterfactuals(w)
             countrcounts = self.generate_counterfactuals(counterfacts.drop(self.out_name, axis=1))
-            results = pd.concat([x, predictions], axis=1)
+            results = pd.concat([x, predictions_df], axis=1)
             print(f'cf len:{len(counterfacts)}, ccf len:{len(countrcounts)}, res len:{len(results)}')
             results = pd.concat([results, counterfacts, countrcounts], axis=0)
             print(f'total len:{len(results)}')
@@ -591,9 +898,13 @@ class Query_API:
             countrcounts = self.generate_counterfactuals(counterfacts.drop(self.out_name, axis=1))
             results = pd.concat([counterfacts, countrcounts], axis=0)
         elif self.method=='onesided':
-            w = x.loc[predictions[self.out_name] < 0.5]
+            if is_multiclass:
+                # Interpret 'onesided' as generating CFs for samples predicted as class 0
+                w = x.loc[predictions_df[self.out_name] == 0]
+            else:
+                w = x.loc[predictions_df[self.out_name] < 0.5]
             counterfacts = self.generate_counterfactuals(w)
-            results = pd.concat([x, predictions], axis=1)
+            results = pd.concat([x, predictions_df], axis=1)
             results = pd.concat([results, counterfacts], axis=0)
         elif self.method=='twosidedcfonly':
             w = x
@@ -601,45 +912,57 @@ class Query_API:
         else:
             w = x
             counterfacts = self.generate_counterfactuals(w)
-            results = pd.concat([x, predictions], axis=1)
+            results = pd.concat([x, predictions_df], axis=1)
             results = pd.concat([results, counterfacts], axis=0)
         return results
     
 
-def define_models(dataframe, targ_arch, surr_archs):
+def define_models(dataframe, targ_arch, surr_archs, num_classes: int = 2):
     targ_reg_coef = 0.001
     surr_reg_coef = 0.001
 
-    # set input dtype explicitly to avoid Lambda shape inference issues when cloning
-    t_in = keras.layers.Input((len(dataframe.columns),), dtype=tf.float32)
+    # infer input dimension (exclude target column if present)
+    input_dim = len(dataframe.columns) if dataframe is not None else None
+    t_in = keras.layers.Input((input_dim,), dtype=tf.float32)
     t = t_in
+
     for layer_size in targ_arch:
-        t = keras.layers.Dense(units=layer_size, 
-                           activation='relu', 
-                           kernel_regularizer=keras.regularizers.L2(l2=targ_reg_coef),
-                           )(t)
-    t = keras.layers.Dense(units=1, 
-                           activation='sigmoid', 
-                           kernel_regularizer=keras.regularizers.L2(l2=targ_reg_coef),
-                           )(t)
-    targ_model = keras.Model(inputs=t_in, outputs=t)
+        t = keras.layers.Dense(units=layer_size,
+                               activation='relu',
+                               kernel_regularizer=keras.regularizers.L2(l2=targ_reg_coef),
+                               )(t)
+
+    # target and surrogate model output shape depends on num_classes
+    # By default keep binary output; callers can set num_classes>2 for multiclass
+    def _build_output_layer(x, num_classes=2, reg_coef=0.0):
+        if num_classes == 2:
+            return keras.layers.Dense(units=1,
+                                      activation='sigmoid',
+                                      kernel_regularizer=keras.regularizers.L2(l2=reg_coef),
+                                      )(x)
+        else:
+            return keras.layers.Dense(units=num_classes,
+                                      activation='softmax',
+                                      kernel_regularizer=keras.regularizers.L2(l2=reg_coef),
+                                      )(x)
+
+    # default num_classes for binary
+    targ_output = _build_output_layer(t, num_classes=num_classes, reg_coef=targ_reg_coef)
+    targ_model = keras.Model(inputs=t_in, outputs=t_output if False else targ_output)
 
     surr_models = []
 
     for surr_arch in surr_archs:
-        s_in = keras.layers.Input((len(dataframe.columns),), dtype=tf.float32)
+        s_in = keras.layers.Input((input_dim,), dtype=tf.float32)
         s = s_in
         for layer_size in surr_arch:
-            s = keras.layers.Dense(units=layer_size, 
-                              activation='relu', 
-                              kernel_regularizer=keras.regularizers.L2(l2=surr_reg_coef),
-                              )(s)
-        s = keras.layers.Dense(units=1, 
-                              activation='sigmoid', 
-                              kernel_regularizer=keras.regularizers.L2(l2=surr_reg_coef),
-                              )(s)
-        surr_model = keras.Model(inputs=s_in, outputs=s)
-        surr_models.append(surr_model)
+            s = keras.layers.Dense(units=layer_size,
+                                   activation='relu',
+                                   kernel_regularizer=keras.regularizers.L2(l2=surr_reg_coef),
+                                   )(s)
+    s_out = _build_output_layer(s, num_classes=num_classes, reg_coef=surr_reg_coef)
+    surr_model = keras.Model(inputs=s_in, outputs=s_out)
+    surr_models.append(surr_model)
 
     return targ_model, surr_models
 
@@ -675,7 +998,10 @@ def generate_query_data(exp_dir,
                         cf_label=0.5,
                         loss_type='onesidemod',
                         min_target_accuracy=0.6,
-                        attack_set_balance=None
+                        attack_set_balance=None,
+                        cf_target_class=None,
+                        num_classes: int = 2,
+                        sample_limit: int = None
                         ):
 
     is_exist = os.path.exists(exp_dir)
@@ -691,10 +1017,17 @@ def generate_query_data(exp_dir,
         os.makedirs(exp_dir)
         print(f'created {exp_dir} instead')
 
-    dataset_obj = ProcessedDataset(dataset)
+    dataset_obj = ProcessedDataset(dataset, sample_limit=sample_limit)
     x_trn, y_trn, x_tst, y_tst, x_atk, y_atk, dataframe, numcols, catcols, targetcol = dataset_obj.get_splits()
 
-    targ_model, surr_models = define_models(x_trn, targ_arch, surr_archs)
+    # infer number of classes from dataset
+    try:
+        unique_labels = np.unique(pd.concat([y_trn, y_tst]))
+        num_classes = int(len(unique_labels))
+    except Exception:
+        num_classes = 2
+
+    targ_model, surr_models = define_models(x_trn, targ_arch, surr_archs, num_classes=num_classes)
     surrmodellen = len(surr_models)
 
     print(f'number of surrogate models: {surrmodellen}')
@@ -705,26 +1038,45 @@ def generate_query_data(exp_dir,
     np.save('{}/imp_naive'.format(exp_dir), np.array(imp_naive))
     np.save('{}/imp_smart'.format(exp_dir), np.array(imp_smart))
 
-    compile_models([targ_model], 
-                losses=[keras.losses.BinaryCrossentropy(from_logits=False)], # Hinge?
+    # select appropriate loss/metrics for target model
+    if num_classes == 2:
+        targ_loss = keras.losses.BinaryCrossentropy(from_logits=False)
+        targ_metrics = [keras.metrics.BinaryAccuracy(threshold=0.5)]
+    else:
+        targ_loss = keras.losses.SparseCategoricalCrossentropy(from_logits=False)
+        targ_metrics = [keras.metrics.SparseCategoricalAccuracy()]
+
+    compile_models([targ_model],
+                losses=[targ_loss],
                 optimizers=[keras.optimizers.Adam(learning_rate=targ_lr)],
-                metrics=[keras.metrics.BinaryAccuracy(threshold=0.5)])
+                metrics=targ_metrics)
 
     naive_models, smart_models = generate_test_models(surr_models)
 
     naive_losses = []
     smart_losses = []
     for m in range(surrmodellen):
-        naive_losses.append(get_modified_loss_fn(keras.losses.BinaryCrossentropy(from_logits=False), imp_naive[m], loss_type=loss_type))
-        smart_losses.append(get_modified_loss_fn(keras.losses.BinaryCrossentropy(from_logits=False), imp_smart[m], loss_type=loss_type))
+        if num_classes == 2:
+            naive_losses.append(get_modified_loss_fn(keras.losses.BinaryCrossentropy(from_logits=False), imp_naive[m], loss_type=loss_type))
+            smart_losses.append(get_modified_loss_fn(keras.losses.BinaryCrossentropy(from_logits=False), imp_smart[m], loss_type=loss_type))
+        else:
+            # for multiclass, use sparse categorical crossentropy (no custom CF loss yet)
+            naive_losses.append(keras.losses.SparseCategoricalCrossentropy(from_logits=False))
+            smart_losses.append(keras.losses.SparseCategoricalCrossentropy(from_logits=False))
+
+    if num_classes == 2:
+        surr_metrics = [keras.metrics.BinaryAccuracy(threshold=0.5)]*surrmodellen
+    else:
+        surr_metrics = [keras.metrics.SparseCategoricalAccuracy()]*surrmodellen
+
     compile_models(naive_models,
                 losses=naive_losses,
                 optimizers=[keras.optimizers.Adam(learning_rate=surr_lr)]*surrmodellen,
-                metrics=[keras.metrics.BinaryAccuracy(threshold=0.5)]*surrmodellen)
+                metrics=surr_metrics)
     compile_models(smart_models, 
                 losses=smart_losses,
                 optimizers=[keras.optimizers.Adam(learning_rate=surr_lr)]*surrmodellen,
-                metrics=[keras.metrics.BinaryAccuracy(threshold=0.5)]*surrmodellen)
+                metrics=surr_metrics)
 
     for m in range(surrmodellen):
         naive_models[m].save('{}/naive_model_{:02d}.keras'.format(exp_dir, m))
@@ -755,7 +1107,7 @@ def generate_query_data(exp_dir,
             tf.random.set_seed(np.random.randint(100))
             reset_weights([targ_model], seed=seed_layers)
             train_models([targ_model], x_trn=x_trn, y_trn=y_trn, epochs=targ_epochs, verbose=0)
-            target_accuracy = evaluate_models([targ_model], x_tst, y_tst)[0][0]
+            target_accuracy = evaluate_models([targ_model], x_tst, y_tst, num_classes=num_classes)[0][0]
             attempt += 1
 
         print(f'sample: {i} targ_accuracy:{target_accuracy}')
@@ -768,7 +1120,7 @@ def generate_query_data(exp_dir,
                               dice_posthoc_sparsity_param=dice_posthoc_sparsity_param,
                               dice_features_to_vary=dice_features_to_vary,
                               knn_k=knn_k, roar_lambda=roar_lambda, roar_delta_max=roar_delta_max, 
-                              cf_label=cf_label)
+                              cf_label=cf_label, cf_target_class=cf_target_class, num_classes=num_classes)
 
         query_gen = Query_Gen(x_atk, catcols, numcols)
 
