@@ -65,3 +65,12 @@ Tests:
 PYTHONPATH=. pytest -q tests/test_iris_smoke.py
 ```
 
+Troubleshooting:
+- If you see ModuleNotFoundError for local modules (for example `No module named 'utils_v8'`), run Python/pytest with the project root on `PYTHONPATH` so the test runner can resolve local imports. Example:
+```bash
+# run a single test file with the project's venv (zsh)
+source .venv/bin/activate
+PYTHONPATH=$(pwd) /replace/with/absolute/path/to/model-reconstruction-using-counterfactuals/.venv/bin/python -m pytest -q tests/test_binary_surrogate.py
+```
+This ensures Python can import modules at the repo root (like `utils_v8.py`).
+
