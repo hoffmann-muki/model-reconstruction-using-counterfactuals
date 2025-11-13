@@ -6,7 +6,7 @@ if __name__=='__main__':
     parser = argparse.ArgumentParser(description='Execute model reconstruction attack using counterfactual examples')
     parser.add_argument('--dir', type=str, default='./', help='Directory to save results')
     parser.add_argument('--dataset', type=str, default='heloc', 
-                        choices=['adultincome', 'dccc', 'compas', 'heloc'], help='Dataset to use')
+                        choices=['adultincome', 'dccc', 'compas', 'heloc', 'iris', 'mnist', 'cifar'], help='Dataset to use')
     parser.add_argument('--use_balanced_df', type=bool, default=True, help='Use a balanced attack set if True')
     parser.add_argument('--query_size', type=int, default=50, help='No. of datapoints in a single query')
     parser.add_argument('--cfmethod', type=str, default='onesided', 
@@ -42,6 +42,14 @@ if __name__=='__main__':
     except ValueError:
         cf_label = args.cflabel
 
+    # multiclass / runtime options
+    parser.add_argument('--num_classes', type=int, default=2, help='Number of classes (set >2 for multiclass datasets)')
+    parser.add_argument('--sample_limit', type=int, default=None, help='Optional subsample limit for large datasets (MNIST/CIFAR)')
+    parser.add_argument('--cf_target_class', type=int, default=None, help='Optional target class for counterfactual generation (int)')
+
+    # reparse to ensure new args are picked up if this file is invoked directly
+    args = parser.parse_args()
+
     timer = Timer()
     timer.start()
     exp_dir = generate_query_data(exp_dir=args.dir,
@@ -66,7 +74,10 @@ if __name__=='__main__':
                         imp_naive=imp_naive,
                         batch_size=args.batch_size,
                         cf_label=cf_label,
-                        loss_type=args.loss_type
+                        loss_type=args.loss_type,
+                        cf_target_class=args.cf_target_class,
+                        num_classes=args.num_classes,
+                        sample_limit=args.sample_limit
                     )
     generate_stats(exp_dir, loss_type=args.loss_type)
     timer.end_and_write_to_file(exp_dir)
