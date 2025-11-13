@@ -60,17 +60,20 @@ Caveats and notes:
 - The code emits pandas FutureWarnings around concat operations; they are non-fatal.
 
 Tests:
-- A small smoke pytest (`tests/test_iris_smoke.py`) is included. Run it with:
+- A small smoke test script (`tests/test_iris_smoke.py`) is included. You can run the script directly with the project's venv Python (no pytest required):
 ```bash
-PYTHONPATH=. pytest -q tests/test_iris_smoke.py
+# activate venv (zsh)
+source .venv/bin/activate
+# run the test script directly (ensures local imports like utils_v8 resolve)
+PYTHONPATH=$(pwd) .venv/bin/python tests/test_iris_smoke.py
 ```
 
 Troubleshooting:
-- If you see ModuleNotFoundError for local modules (for example `No module named 'utils_v8'`), run Python/pytest with the project root on `PYTHONPATH` so the test runner can resolve local imports. Example:
+- If you see ModuleNotFoundError for local modules (for example `No module named 'utils_v8'`), run the test script with the project root on `PYTHONPATH` so Python can resolve local imports. Example:
 ```bash
-# run a single test file with the project's venv (zsh)
+# activate venv (zsh)
 source .venv/bin/activate
-PYTHONPATH=$(pwd) /replace/with/absolute/path/to/model-reconstruction-using-counterfactuals/.venv/bin/python -m pytest -q tests/test_binary_surrogate.py
+# run tests directly with the venv Python
+PYTHONPATH=$(pwd) .venv/bin/python tests/test_binary_surrogate.py
 ```
 This ensures Python can import modules at the repo root (like `utils_v8.py`).
-
