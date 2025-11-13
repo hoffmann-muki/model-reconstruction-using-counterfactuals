@@ -4,16 +4,15 @@ This repository provides the code for the paper [*"Model reconstruction using co
 ## Experiments
 ### Setup
 ```bash
-pip install foolbox
-pip install adversarial-robustness-toolbox
 pip install -r requirements.txt
+pip install foolbox adversarial-robustness-toolbox
 ```
 
 ### Running the experiments
-The script `examples.sh` contains a Bash script for running experiments. For more options, look into `main.py`.
+The script `example.sh` contains convenience commands for running experiments; for programmatic runs see `main.py`.
 ```bash
 python main.py --dir ./results/test --dataset heloc --use_balanced_df True --query_size 50 --cfgenerator mccf \
-               --num_queries 8--ensemble_size 50 --target_archi 20 10 --surr_archi 20 10
+               --num_queries 8 --ensemble_size 50 --target_archi 20 10 --surr_archi 20 10
 ```
 
 ### Visualizing results
@@ -36,7 +35,7 @@ Key flags and utility functions:
 
 Examples (run in project root, activate the virtualenv first):
 
-Run a quick Iris smoke experiment (multiclass):
+Quick Iris smoke experiment (multiclass):
 ```bash
 python - <<'PY'
 from utils_v8 import generate_query_data
@@ -45,7 +44,7 @@ generate_query_data('results/test_smoke_iris', 'iris', True, 2, 'naivedat', 'one
 PY
 ```
 
-Run a subsampled MNIST smoke experiment (500 samples):
+Subsampled MNIST smoke experiment (500 samples):
 ```bash
 python - <<'PY'
 from utils_v8 import generate_query_data
@@ -55,13 +54,13 @@ PY
 ```
 
 Caveats and notes:
-- KNN now builds per-class pools and a global fallback search to return *real samples* as fallback counterfactuals (preferred over centroids). This increases the chance a fallback CF is actionable and labeled appropriately.
+- KNN now builds per-class pools and a global fallback search to return *real samples* as fallback counterfactuals. This increases the chance a fallback CF is actionable and labeled appropriately.
 - DiCE receives `desired_class=int(cf_target_class)` when provided. For binary tasks, `desired_class='opposite'` is used by default.
 - ROAR/IterativeSearch are passed `num_classes` where applicable; ROAR uses a nearest-neighbor fallback that returns a real sample if the recourse solver fails for multiclass targets.
 - The code emits pandas FutureWarnings around concat operations; they are non-fatal.
 
 Tests:
-- A small pytest `tests/test_iris_smoke.py` is included as a smoke test. Run it with:
+- A small smoke pytest (`tests/test_iris_smoke.py`) is included. Run it with:
 ```bash
 PYTHONPATH=. pytest -q tests/test_iris_smoke.py
 ```
