@@ -15,6 +15,40 @@ python main.py --dir ./results/test --dataset heloc --use_balanced_df True --que
                --num_queries 8 --ensemble_size 50 --target_archi 20 10 --surr_archi 20 10
 ```
 
+## Key Configuration Options
+
+### Counterfactual Label Selection (`--cflabel`)
+The system automatically selects appropriate counterfactual labels based on classification task:
+
+- **Binary Classification**: Default `cf_label = 0.5` (decision boundary)
+- **Multiclass Classification**: Default `cf_label = 'prediction'` (uses model prediction)
+- **Out-of-Band Mode**: Use `--cflabel out-of-band` for multiclass CF-aware training
+  - Binary: `cf_label = 0.5` (same as default)
+  - Multiclass: `cf_label = -1` (special marker for masking)
+
+**Options**:
+- `auto` (default): Automatically selects 0.5 for binary, 'prediction' for multiclass
+- `out-of-band`: Enables CF-aware loss for multiclass using -1 marker
+- `prediction`: Uses target model predictions as CF labels
+- Numeric value (e.g., `0.7`): Custom threshold for binary classification
+
+### Loss Functions (`--loss_type`)
+The implementation supports different loss strategies for binary and multiclass settings:
+
+**Binary Classification**:
+- `ordinary`: Standard binary cross-entropy
+- `onesidemod`: CF-aware loss with penalty term for samples at threshold (default)
+- `bcecf`: Binary cross-entropy with soft labels  
+- `twosidemod`: CF-aware loss accounting for both sides of decision boundary
+
+**Multiclass Classification (out-of-band mode)**:
+- `ordinary`: Standard sparse categorical cross-entropy
+- `onesidemod`: CF-aware loss that masks out CF samples (y=-1) and trains only on regular samples
+
+The CF-aware loss differs between binary and multiclass:
+- **Binary**: Applies penalty term encouraging predictions near threshold for CF samples
+- **Multiclass**: Masks CF samples (y=-1) and excludes them from gradient computation
+
 ### Visualizing results
 The experiments generate files containing the queries, models and statistics. To visualize the results, use the Jupyter Notebook `visualize.ipynb`. The directory [results](results) provides some results that are included in the paper.
 
@@ -24,56 +58,51 @@ Our code uses the codebase from the paper *"Black, E., Wang, Z., Fredrikson, M.,
 ## License
 Please see [LICENSE](LICENSE).
 
-## Multiclass & Testing (new)
+## Multiclass Support & Testing
 
-The codebase now supports multiclass datasets (Iris, MNIST, CIFAR) and includes helpers for testing and small smoke runs.
+The codebase supports multiclass datasets (Iris, MNIST, CIFAR) with automatic CF label selection and CF-aware loss functions.
 
-Key flags and utility functions:
-- `cf_target_class` (int or None): when provided, counterfactual backends that support class-targeted CFs (e.g., DiCE) will request CFs for that target class. If not provided, binary tasks use `desired_class='opposite'` and multiclass tasks let the backend decide.
-- `num_classes` (int): pass the number of classes (useful when calling `generate_query_data` directly).
-- `sample_limit` (int or None): when loading large datasets (MNIST/CIFAR) you can pass a `sample_limit` to subsample the dataset for quick smoke runs.
+### Key Features
+- **Automatic cf_label selection**: Binary tasks use 0.5 threshold, multiclass uses model predictions or out-of-band mode
+- **CF-aware loss for multiclass**: Out-of-band mode uses -1 marker to mask CF samples during training
+- **Multiclass datasets**: Built-in support for Iris, MNIST, CIFAR with optional subsampling
+- **Test utilities**: Comprehensive test suite in `tests/` directory
 
-Examples (run in project root, activate the virtualenv first):
+### Additional Arguments
+- `--cf_target_class` (int): Target class for CF generation (when supported by backend)
+- `--num_classes` (int): Number of classes for multiclass datasets  
+- `--sample_limit` (int): Subsample large datasets for quick testing
 
-Quick Iris smoke experiment (multiclass):
+### Examples
+
+**Binary classification with CF-aware loss:**
 ```bash
-python - <<'PY'
-from utils_v8 import generate_query_data
-generate_query_data('results/test_smoke_iris', 'iris', True, 2, 'naivedat', 'onesided', 'knn', 2, 'TF', 'random', 1, 1,
-                    [16], 3, 0.01, [[8]], 2, 0.01, [-1], [-1], 16, cf_target_class=1)
-PY
+python main.py --dataset heloc --cflabel auto --loss_type onesidemod
 ```
 
-Subsampled MNIST smoke experiment (500 samples):
+**Multiclass with out-of-band CF-aware training:**
 ```bash
-python - <<'PY'
-from utils_v8 import generate_query_data
-generate_query_data('results/test_smoke_mnist', 'mnist', True, 2, 'naivedat', 'onesided', 'knn', 2, 'TF', 'random', 1, 1,
-                    [32], 3, 0.01, [[16]], 2, 0.01, [-1], [-1], 16, cf_target_class=1, num_classes=10, sample_limit=500)
-PY
+python main.py --dataset iris --cflabel out-of-band --loss_type onesidemod --num_classes 3
 ```
 
-Caveats and notes:
-- KNN now builds per-class pools and a global fallback search to return *real samples* as fallback counterfactuals. This increases the chance a fallback CF is actionable and labeled appropriately.
-- DiCE receives `desired_class=int(cf_target_class)` when provided. For binary tasks, `desired_class='opposite'` is used by default.
-- ROAR/IterativeSearch are passed `num_classes` where applicable; ROAR uses a nearest-neighbor fallback that returns a real sample if the recourse solver fails for multiclass targets.
-- The code emits pandas FutureWarnings around concat operations; they are non-fatal.
-
-Tests:
-- A small smoke test script (`tests/test_iris_smoke.py`) is included. You can run the script directly with the project's venv Python (no pytest required):
+**Quick MNIST experiment with subsampling:**
 ```bash
-# activate venv (zsh)
+python main.py --dataset mnist --num_classes 10 --sample_limit 1000 --ensemble_size 2
+```
+
+### Testing
+Run the test suite to verify functionality:
+```bash
+# Activate virtual environment
 source .venv/bin/activate
-# run the test script directly (ensures local imports like utils_v8 resolve)
-PYTHONPATH=$(pwd) .venv/bin/python tests/test_iris_smoke.py
+
+# Test CF label auto-selection logic
+PYTHONPATH=$(pwd) python tests/test_cf_label_simple.py
+
+# Test multiclass CF-aware loss (requires datasets)
+PYTHONPATH=$(pwd) python tests/test_out_of_band_mode.py
 ```
 
-Troubleshooting:
-- If you see ModuleNotFoundError for local modules (for example `No module named 'utils_v8'`), run the test script with the project root on `PYTHONPATH` so Python can resolve local imports. Example:
-```bash
-# activate venv (zsh)
-source .venv/bin/activate
-# run tests directly with the venv Python
-PYTHONPATH=$(pwd) .venv/bin/python tests/test_binary_surrogate.py
-```
-This ensures Python can import modules at the repo root (like `utils_v8.py`).
+### Utilities
+- `tools/inspect_stats.py`: Examine .npy/.csv statistics files with human-readable output
+- `tests/`: Comprehensive test suite for new functionality

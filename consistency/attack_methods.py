@@ -148,7 +148,7 @@ class IterativeSearch(Counterfactual):
         super().__init__(*args, **kwargs)
         self.norm = norm
 
-    def generate_counterfactual(self, x, batch_size, **kwargs):
+    def generate_counterfactual(self, x, batch_size=32, **kwargs):
         if self.norm == 1:
             adv_x, _, is_adv = IGD_L1(self.model,
                                       x,
@@ -169,11 +169,4 @@ class IterativeSearch(Counterfactual):
                                       **kwargs)
         else:
             raise ValueError("norm must be integers (1 or 2)")
-
-        #Edited by SD
-        #adv_x = adv_x[is_adv]
-        
-
         return adv_x
-
-

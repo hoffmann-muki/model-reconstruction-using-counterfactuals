@@ -24,9 +24,11 @@ if __name__=='__main__':
                         help='Surrogate model architecture')
     parser.add_argument('--surr_epochs', type=int, default=200, help='Surrogate model training epochs')
     parser.add_argument('--batch_size', type=int, default=32, help='Training batch size')
-    parser.add_argument('--cflabel', type=str, default='0.5', 
+    parser.add_argument('--cflabel', type=str, default='auto', 
                         help=('Label to use for counterfactual explanations in the query results; '
-                              'can be a float in [0,1] or \'prediction\' to use the softmax output of the target'))
+                              'can be a float (e.g., 0.5 for binary), \'prediction\' to use target model output, '
+                              '\'out-of-band\' to use -1 marker with CF-aware loss for multiclass, '
+                              'or \'auto\' (default: 0.5 for binary, prediction for multiclass)'))
     parser.add_argument('--loss_type', type=str, default='onesidemod', 
                         choices=['onesidemod', 'ordinary', 'bcecf', 'twosidemod'],
                         help=('onesidemod: CCA loss as described in the paper; '
@@ -37,13 +39,20 @@ if __name__=='__main__':
     args = parser.parse_args()
     imp_naive = [-1]
     imp_smart = [0.5]
-    try:
-        cf_label = float(args.cflabel)
-    except ValueError:
+    
+    # Parse cf_label: 'auto' -> None (auto-select), numeric -> float, else string
+    if args.cflabel == 'auto':
+        cf_label = None
+    elif args.cflabel in ['out-of-band', 'prediction']:
         cf_label = args.cflabel
+    else:
+        try:
+            cf_label = float(args.cflabel)
+        except ValueError:
+            cf_label = args.cflabel
 
     # multiclass / runtime options
-    parser.add_argument('--num_classes', type=int, default=2, help='Number of classes (set >2 for multiclass datasets)')
+    parser.add_argument('--num_classes', type=int, default=2, help='Number of classes (choose n>2 for multiclass datasets)')
     parser.add_argument('--sample_limit', type=int, default=None, help='Optional subsample limit for large datasets (MNIST/CIFAR)')
     parser.add_argument('--cf_target_class', type=int, default=None, help='Optional target class for counterfactual generation (int)')
 

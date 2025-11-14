@@ -3,9 +3,9 @@ import numpy as np
 import pandas as pd
 from utils_v8 import ProcessedDataset, define_models, compile_models, train_models, evaluate_models, generate_query_data
 import tensorflow as tf
-from tensorflow import keras
+import keras
 
-print("=== Multiclass Surrogate Model Test (Iris 3-class) ===")
+print("=== Multiclass Surrogate Model Test ===")
 
 # Load Iris dataset (3 classes)
 dataset_obj = ProcessedDataset('iris')
@@ -42,7 +42,7 @@ print(f"Prediction probabilities:\n{test_preds}")
 
 # Generate multiclass counterfactual queries
 print("Generating multiclass counterfactual queries...")
-exp_dir = generate_query_data('results/test_multiclass_surrogate', 'iris', True, 8, 'naivedat', 'onesided', 'knn', 2, 'TF', 'random',
+exp_dir = generate_query_data('results/test_multiclass_surrogate', 'iris', True, 8, 'naivedat', 'onesided', 'knn', 2, 'TF2', 'random',
                               1, 1, [20, 10], 8, 0.01, [[10], [16]], 12, 0.01, [-1, -1], [-1, -1], 32, 
                               cf_target_class=2, num_classes=3)
 
@@ -71,8 +71,8 @@ if os.path.exists(query_file):
     # Test surrogate predictions vs target predictions
     print("\nComparing surrogate vs target predictions:")
     target_test_preds = np.argmax(targ_model.predict(x_tst[:10]), axis=1)
-    surr1_test_preds = np.argmax(surr_model_1.predict(x_tst[:10]), axis=1)
-    surr2_test_preds = np.argmax(surr_model_2.predict(x_tst[:10]), axis=1)
+    surr1_test_preds = np.argmax(surr_model_1.predict(x_tst[:10]), axis=1) # type: ignore
+    surr2_test_preds = np.argmax(surr_model_2.predict(x_tst[:10]), axis=1) # type: ignore
     
     print(f"True labels:  {y_tst[:10].values}")
     print(f"Target preds: {target_test_preds}")

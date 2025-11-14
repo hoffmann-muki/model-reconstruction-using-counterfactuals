@@ -449,7 +449,74 @@ class ProcessedDataset:
 
 
 
-def get_modified_loss_fn(base_loss, k, loss_type):
+def get_multiclass_cf_loss_fn(base_loss, num_classes, k=0.5):
+    """
+    Simplified multiclass CF-aware loss function.
+    - Samples with y_true == -1 are counterfactuals (out-of-band marker)
+    - Regular samples (y_true >= 0) use standard SparseCategoricalCrossentropy
+    - CF samples get minimal loss (just ignore them or use small entropy penalty)
+    
+    Args:
+        base_loss: SparseCategoricalCrossentropy loss function
+        num_classes: number of classes
+        k: confidence threshold for CF loss reduction (default 0.5)
+    """
+    eps = 1e-7
+    
+    def loss_fn(y_true, y_pred):
+        y_true = tf.cast(y_true, tf.float32)
+        y_pred = tf.cast(y_pred, tf.float32)
+        
+        # Identify CF samples (y_true == -1)
+        is_cf = tf.equal(y_true, -1.0)
+        is_regular = tf.logical_not(is_cf)
+        
+        # For regular samples: use standard sparse categorical crossentropy
+        # Replace CF labels (-1) with 0 to avoid errors, but we'll mask them out
+        y_true_safe = tf.where(is_regular, y_true, tf.zeros_like(y_true))
+        y_true_int = tf.cast(y_true_safe, tf.int32)
+        
+        # Compute standard cross-entropy loss
+        # Use reduction='none' to get per-sample losses for masking
+        per_sample_loss = tf.keras.losses.sparse_categorical_crossentropy(
+            y_true_int, y_pred, from_logits=False
+        )
+        
+        # Apply mask: only count regular samples, zero out CF samples
+        is_regular_float = tf.cast(is_regular, tf.float32)
+        masked_loss = per_sample_loss * is_regular_float
+        
+        # Average only over regular samples
+        n_regular = tf.reduce_sum(is_regular_float)
+        regular_loss = tf.reduce_sum(masked_loss) / tf.maximum(n_regular, 1.0)
+        
+        # For CF samples: use a very small fixed penalty or ignore them
+        # (In practice, ignoring CF samples by masking is the simplest approach)
+        # If you want CF-aware training, just return regular_loss
+        return regular_loss
+    
+    return loss_fn
+
+
+def get_modified_loss_fn(base_loss, k, loss_type, num_classes=2):
+    """
+    Get a modified loss function for binary or multiclass classification with CF-aware training.
+    
+    Args:
+        base_loss: base loss function (BinaryCrossentropy or SparseCategoricalCrossentropy)
+        k: CF threshold parameter (or -1 for ordinary loss, -2 for bcecf)
+        loss_type: type of CF-aware loss ('ordinary', 'bcecf', 'onesidemod', 'twosidemod')
+        num_classes: number of classes (2 for binary, >2 for multiclass)
+    
+    Returns:
+        A loss function compatible with Keras model.compile()
+    """
+    # For multiclass with cf_label=-1 (out-of-band), use the multiclass CF-aware loss
+    # This is detected when num_classes > 2 and loss_type is not 'ordinary'
+    if num_classes > 2 and loss_type != 'ordinary':
+        return get_multiclass_cf_loss_fn(base_loss, num_classes, k=0.5)
+    
+    # Binary CF-aware loss (original implementation)
     # Evaluate k as a Python float when possible to avoid Python boolean checks on tensors in graph mode
     try:
         k_py = float(k)
@@ -540,18 +607,35 @@ class Query_Gen:
         elif method == "naivedat":
             queries = self.dataframe.sample(n=N, ignore_index=True)
         elif method == "smartuni":
+            # Create data_range from the ranges dictionary
+            feature_cols = list(self.categories.keys()) + list(self.ranges.keys())
+            data_range = []
+            for col in feature_cols:
+                if col in self.ranges:
+                    data_range.append([self.ranges[col][0], self.ranges[col][1]])
+                else:
+                    # For categorical columns, use min/max of unique values
+                    cat_vals = self.categories[col]
+                    data_range.append([min(cat_vals), max(cat_vals)])
             data_range = np.array(data_range)
-            queries = np.empty([0,model.input_shape[1]], np.float32)
+            n_features = len(feature_cols)
+            
+            queries = np.empty([0, model.input_shape[1]], np.float32)
             while queries.shape[0] < N:
-                naive_queries = np.random.uniform(low=data_range[:,0], high=data_range[:,1], size=(N,n_features))
+                naive_queries = np.random.uniform(low=data_range[:,0], high=data_range[:,1], size=(N, n_features))
                 y_hat = model.predict(naive_queries)
-                queries.append(np.where(y_hat > 0.5)) # get queries with prediction y_hat=1
+                positive_indices = np.where(y_hat > 0.5)[0]
+                if len(positive_indices) > 0:
+                    queries = np.concatenate([queries, naive_queries[positive_indices]], axis=0)
         elif method == "smartdat":
-            queries = np.empty([0,model.input_shape[1]], np.float32)
+            queries = np.empty([0, model.input_shape[1]], np.float32)
             while queries.shape[0] < N:
-                naive_queries = data_distrib(N)
+                # Use dataframe sampling instead of undefined data_distrib
+                naive_queries = self.dataframe.sample(n=N, replace=True).drop(self.dataframe.columns[-1], axis=1)
                 y_hat = model.predict(naive_queries)
-                queries.append(np.where(y_hat > 0.5)) # get queries with prediction y_hat=1
+                positive_indices = np.where(y_hat > 0.5)[0]
+                if len(positive_indices) > 0:
+                    queries = np.concatenate([queries, naive_queries.iloc[positive_indices].values], axis=0)
         else:
             print("generate_queries(): {} is not a valid query generation method".format(method))
         return queries[:N]
@@ -865,7 +949,8 @@ class Query_API:
                 else:
                     labels = np.argmax(preds, axis=1)
                     cfs[out_name] = labels
-            elif isinstance(self.cf_label, (int, float)) and self.cf_label >= 0:
+            elif isinstance(self.cf_label, (int, float)):
+                # Allow both positive labels (0.5 for binary) and negative out-of-band markers (-1 for multiclass)
                 cfs[out_name] = self.cf_label
             return cfs
         else:
@@ -995,7 +1080,7 @@ def generate_query_data(exp_dir,
                         knn_k=1,
                         roar_lambda=0.01, 
                         roar_delta_max=0.1,
-                        cf_label=0.5,
+                        cf_label=None,  # None = auto-select: 0.5 for binary, 'prediction' for multiclass
                         loss_type='onesidemod',
                         min_target_accuracy=0.6,
                         attack_set_balance=None,
@@ -1027,6 +1112,23 @@ def generate_query_data(exp_dir,
     except Exception:
         num_classes = 2
 
+    # Auto-select cf_label if not specified: 0.5 for binary, 'prediction' for multiclass
+    if cf_label is None:
+        if num_classes == 2:
+            cf_label = 0.5
+            print('Using cf_label=0.5 (binary CF marker)')
+        else:
+            cf_label = 'prediction'
+            print(f'Using cf_label="prediction" for multiclass (num_classes={num_classes})')
+    elif cf_label == 'out-of-band':
+        # Use out-of-band markers: 0.5 for binary, -1 for multiclass
+        if num_classes == 2:
+            cf_label = 0.5
+            print('Using cf_label=0.5 (binary out-of-band CF marker)')
+        else:
+            cf_label = -1
+            print(f'Using cf_label=-1 (multiclass out-of-band CF marker, num_classes={num_classes})')
+
     targ_model, surr_models = define_models(x_trn, targ_arch, surr_archs, num_classes=num_classes)
     surrmodellen = len(surr_models)
 
@@ -1057,12 +1159,14 @@ def generate_query_data(exp_dir,
     smart_losses = []
     for m in range(surrmodellen):
         if num_classes == 2:
-            naive_losses.append(get_modified_loss_fn(keras.losses.BinaryCrossentropy(from_logits=False), imp_naive[m], loss_type=loss_type))
-            smart_losses.append(get_modified_loss_fn(keras.losses.BinaryCrossentropy(from_logits=False), imp_smart[m], loss_type=loss_type))
+            naive_losses.append(get_modified_loss_fn(keras.losses.BinaryCrossentropy(from_logits=False), imp_naive[m], loss_type=loss_type, num_classes=num_classes))
+            smart_losses.append(get_modified_loss_fn(keras.losses.BinaryCrossentropy(from_logits=False), imp_smart[m], loss_type=loss_type, num_classes=num_classes))
         else:
-            # for multiclass, use sparse categorical crossentropy (no custom CF loss yet)
-            naive_losses.append(keras.losses.SparseCategoricalCrossentropy(from_logits=False))
-            smart_losses.append(keras.losses.SparseCategoricalCrossentropy(from_logits=False))
+            # For multiclass with out-of-band CF markers (cf_label=-1), use CF-aware loss
+            # Otherwise use standard SparseCategoricalCrossentropy
+            base_loss = keras.losses.SparseCategoricalCrossentropy(from_logits=False)
+            naive_losses.append(get_modified_loss_fn(base_loss, imp_naive[m], loss_type=loss_type, num_classes=num_classes))
+            smart_losses.append(get_modified_loss_fn(base_loss, imp_smart[m], loss_type=loss_type, num_classes=num_classes))
 
     if num_classes == 2:
         surr_metrics = [keras.metrics.BinaryAccuracy(threshold=0.5)]*surrmodellen
@@ -1106,7 +1210,7 @@ def generate_query_data(exp_dir,
             seed_layers = np.random.randint(100)
             tf.random.set_seed(np.random.randint(100))
             reset_weights([targ_model], seed=seed_layers)
-            train_models([targ_model], x_trn=x_trn, y_trn=y_trn, epochs=targ_epochs, verbose=0)
+            train_models([targ_model], x_trn=x_trn, y_trn=y_trn, epochs=targ_epochs, verbose=1)
             target_accuracy = evaluate_models([targ_model], x_tst, y_tst, num_classes=num_classes)[0][0]
             attempt += 1
 
@@ -1141,6 +1245,13 @@ def generate_stats(exp_dir, pop_noncf=True, noise_sigma=0, loss_type='onesidemod
     dataset_obj = ProcessedDataset(dataset)
     x_trn, y_trn, x_tst, y_tst, x_atk, y_atk, dataframe, numcols, catcols, targetcol = dataset_obj.get_splits()
     
+    # Infer number of classes from dataset
+    try:
+        unique_labels = np.unique(pd.concat([y_trn, y_tst]))
+        num_classes = int(len(unique_labels))
+    except Exception:
+        num_classes = 2
+    
     num_models = int(info_df['num_models'][0])
     naive_models = []
     smart_models = []
@@ -1149,10 +1260,15 @@ def generate_stats(exp_dir, pop_noncf=True, noise_sigma=0, loss_type='onesidemod
     print(f'imp_naive: {imp_naive}, imp_smart: {imp_smart}')
 
     for m in range(num_models):
+        if num_classes == 2:
+            base_loss = keras.losses.BinaryCrossentropy(from_logits=False)
+        else:
+            base_loss = keras.losses.SparseCategoricalCrossentropy(from_logits=False)
+            
         naive_models.append(keras.models.load_model('{}/naive_model_{:02d}.keras'.format(exp_dir, m), \
-            custom_objects={'loss_fn':get_modified_loss_fn(keras.losses.BinaryCrossentropy(from_logits=False), imp_naive[m], loss_type=loss_type)}))
+            custom_objects={'loss_fn':get_modified_loss_fn(base_loss, imp_naive[m], loss_type=loss_type, num_classes=num_classes)}))
         smart_models.append(keras.models.load_model('{}/smart_model_{:02d}.keras'.format(exp_dir, m), \
-            custom_objects={'loss_fn':get_modified_loss_fn(keras.losses.BinaryCrossentropy(from_logits=False), imp_smart[m], loss_type=loss_type)}))
+            custom_objects={'loss_fn':get_modified_loss_fn(base_loss, imp_smart[m], loss_type=loss_type, num_classes=num_classes)}))
 
     query_batch_size = int(info_df['query_batch_size'][0])
     query_gen_method = str(info_df['query_gen_method'][0])
@@ -1247,12 +1363,13 @@ def generate_stats(exp_dir, pop_noncf=True, noise_sigma=0, loss_type='onesidemod
     acc_naive = np.array(acc_naive)
     acc_smart = np.array(acc_smart)
 
-    np.save('{}/{}'.format(exp_dir,'fid_naive'), fid_naive)
-    np.save('{}/{}'.format(exp_dir,'fid_smart'), fid_smart)
-    np.save('{}/{}'.format(exp_dir,'fid_uni_naive'), fid_uni_naive)
-    np.save('{}/{}'.format(exp_dir,'fid_uni_smart'), fid_uni_smart)
-    np.save('{}/{}'.format(exp_dir,'acc_naive'), acc_naive)
-    np.save('{}/{}'.format(exp_dir,'acc_smart'), acc_smart)
+    # Use np.save to preserve array dimensionality (supports >2D) and match .npy expectations
+    np.save(f'{exp_dir}/fid_naive.npy', fid_naive)
+    np.save(f'{exp_dir}/fid_smart.npy', fid_smart)
+    np.save(f'{exp_dir}/fid_uni_naive.npy', fid_uni_naive)
+    np.save(f'{exp_dir}/fid_uni_smart.npy', fid_uni_smart)
+    np.save(f'{exp_dir}/acc_naive.npy', acc_naive)
+    np.save(f'{exp_dir}/acc_smart.npy', acc_smart)
 
 
 def add_noise(query_df, targetcol, numcols, targ_model, pop_noncf=True, sigma=0):
@@ -1291,8 +1408,3 @@ class Timer:
 
         with open(f'{filepath}/execution_time.txt', 'w') as file:
             file.write(f'Execution Time: {time_elapsed} seconds')
-
-
-
-
-

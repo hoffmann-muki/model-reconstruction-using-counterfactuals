@@ -1,2 +1,0 @@
-,query_batch_size,query_gen_method,num_queries,ensemble_size,targ_epochs,surr_epochs,surr_batch_size,dataset,num_models
-0,20,naivedat,20,100,200,200,32,compas,2
