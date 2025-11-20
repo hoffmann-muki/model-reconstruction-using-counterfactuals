@@ -35,6 +35,10 @@ if __name__=='__main__':
                               'ordinary: ordinary binary cross entropy loss with hard labels; '
                               'bcecf: binary cross entropy loss with soft labels; '
                               'twosidemod: CCA loss that accounts for CFs from both sides of the decision boundary'))
+    # multiclass options
+    parser.add_argument('--num_classes', type=int, default=2, help='Number of classes (choose n>2 for multiclass datasets)')
+    parser.add_argument('--sample_limit', type=int, default=None, help='Optional subsample limit for large datasets (MNIST/CIFAR)')
+    parser.add_argument('--cf_target_class', type=int, default=None, help='Optional target class for counterfactual generation (int)')
 
     args = parser.parse_args()
     imp_naive = [-1]
@@ -50,14 +54,6 @@ if __name__=='__main__':
             cf_label = float(args.cflabel)
         except ValueError:
             cf_label = args.cflabel
-
-    # multiclass / runtime options
-    parser.add_argument('--num_classes', type=int, default=2, help='Number of classes (choose n>2 for multiclass datasets)')
-    parser.add_argument('--sample_limit', type=int, default=None, help='Optional subsample limit for large datasets (MNIST/CIFAR)')
-    parser.add_argument('--cf_target_class', type=int, default=None, help='Optional target class for counterfactual generation (int)')
-
-    # reparse to ensure new args are picked up if this file is invoked directly
-    args = parser.parse_args()
 
     timer = Timer()
     timer.start()

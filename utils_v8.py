@@ -15,7 +15,7 @@ from sklearn.neighbors import NearestNeighbors
 from sklearn import datasets as sk_datasets
 
 import tensorflow as tf
-from tensorflow import keras
+import keras
 
 import datasets
 from datasets import load_dataset
